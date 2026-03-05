@@ -1,6 +1,6 @@
 # Distributed Node Orchestration Framework
 
-A modular Python framework for centralized command-and-control orchestration of remote tasking agents. Built for **DevOps automation** and **security research** portfolios.
+A modular Python framework for centralized command-and-control orchestration of remote tasking agents. Built for **DevOps automation** and **security research**.
 
 ---
 
